@@ -1,8 +1,10 @@
 """Memory-conscious chord-engine pipeline for EarColor on Railway.
 
-Keeps the trained BTC/ChordMini inference and key/segment post-processing,
-but avoids the duplicate full-song chroma + beat-analysis pass that caused
-large memory spikes before model inference.
+Keeps trained BTC inference and key/segment post-processing while fitting
+inside the 1 GB Railway instance. This version uses the original compact BTC
+model (25 chord classes: major/minor + no-chord) instead of the heavier
+ChordMini 170-class model, because the latter is being killed by the host
+memory limit during real-song analysis.
 """
 
 import asyncio
@@ -29,7 +31,10 @@ _detector = None
 def get_detector(device: str):
     global _detector
     if _detector is None:
-        _detector = load_detector(device, use_chordmini=True)
+        # Original BTC trained model: substantially lighter in RAM than
+        # ChordMini/170-class while preserving the core requirement for
+        # EarColor: stable trained-model root + major/minor chord recognition.
+        _detector = load_detector(device, large_voca=False, use_chordmini=False)
     return _detector
 
 
@@ -47,10 +52,8 @@ def _run_analysis_stages(
     y = audio_dict["y"]
     sr = audio_dict["sr"]
 
-    # Important for the 1 GB Railway instance: do not compute a second
-    # full-song chromagram / HPSS / beat grid before BTC. BTC extracts the
-    # model CQT itself, so the old pass duplicated memory without helping
-    # EarColor's main harmonic readout.
+    # Avoid a duplicate full-song chroma/HPSS/beat pass. BTC extracts the
+    # model CQT itself; doing both substantially increases peak RAM.
     beat_times = []
 
     job_store.update_progress(job_id, 25 + progress_offset, "Loading BTC model...")
