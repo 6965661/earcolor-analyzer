@@ -1,13 +1,12 @@
 """Memory-conscious chord-engine pipeline for EarColor on Railway.
 
-Keeps trained BTC inference and key/segment post-processing while fitting
-inside the 1 GB Railway instance. This version uses the original compact BTC
-model (25 chord classes: major/minor + no-chord) instead of the heavier
-ChordMini 170-class model, because the latter is being killed by the host
-memory limit during real-song analysis.
+Runs the original compact trained BTC model in short audio chunks so peak
+memory stays below Railway's 1 GB limit. Chord frames are concatenated back
+into one timeline before smoothing, key inference and segment generation.
 """
 
 import asyncio
+import gc
 import os
 import time
 from datetime import datetime, timezone
@@ -26,16 +25,39 @@ from api.services.job_store import job_store
 from config import MODEL
 
 _detector = None
+CHUNK_SECONDS = 12.0
 
 
 def get_detector(device: str):
     global _detector
     if _detector is None:
-        # Original BTC trained model: substantially lighter in RAM than
-        # ChordMini/170-class while preserving the core requirement for
-        # EarColor: stable trained-model root + major/minor chord recognition.
         _detector = load_detector(device, large_voca=False, use_chordmini=False)
     return _detector
+
+
+def _predict_in_chunks(detector, y, sr, job_id: str):
+    chunk_samples = max(1, int(CHUNK_SECONDS * sr))
+    total_samples = len(y)
+    raw_chords = []
+
+    for idx, start in enumerate(range(0, total_samples, chunk_samples)):
+        end = min(start + chunk_samples, total_samples)
+        chunk = y[start:end]
+        if len(chunk) < int(1.0 * sr):
+            break
+
+        pct = 40 + int(28 * end / max(total_samples, 1))
+        job_store.update_progress(
+            job_id,
+            min(pct, 68),
+            f"Running trained chord model... {int(100 * end / max(total_samples, 1))}%",
+        )
+        chunk_predictions = detector.predict(chunk, sr)
+        raw_chords.extend(chunk_predictions)
+        del chunk_predictions, chunk
+        gc.collect()
+
+    return raw_chords
 
 
 def _run_analysis_stages(
@@ -51,16 +73,15 @@ def _run_analysis_stages(
     audio_dict = load_audio(audio_path)
     y = audio_dict["y"]
     sr = audio_dict["sr"]
-
-    # Avoid a duplicate full-song chroma/HPSS/beat pass. BTC extracts the
-    # model CQT itself; doing both substantially increases peak RAM.
     beat_times = []
 
     job_store.update_progress(job_id, 25 + progress_offset, "Loading BTC model...")
     detector = get_detector(device)
 
-    job_store.update_progress(job_id, 45 + progress_offset, "Running trained chord model...")
-    raw_chords = detector.predict(y, sr)
+    job_store.update_progress(job_id, 40 + progress_offset, "Running trained chord model...")
+    raw_chords = _predict_in_chunks(detector, y, sr, job_id)
+    if not raw_chords:
+        raise RuntimeError("BTC model returned no chord frames")
 
     job_store.update_progress(job_id, 72 + progress_offset, "Stabilizing chord sequence...")
     smoothed = smooth_chords(raw_chords, method=smooth_method)
