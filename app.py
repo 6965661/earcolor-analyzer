@@ -9,7 +9,9 @@ import numpy as np
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="EarColor Analyzer", version="2.0")
+from neural_engine import analyze_neural
+
+app = FastAPI(title="EarColor Analyzer", version="3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -134,7 +136,7 @@ def merge_short_segments(segments, min_duration=0.55):
     return out
 
 
-def analyze_audio(path, job_id):
+def analyze_audio_lightweight(path, job_id):
     set_job(job_id, progress=8, stage="Loading audio...")
     y, sr = librosa.load(path, sr=22050, mono=True, dtype=np.float32)
     if y.size < sr // 2:
@@ -224,7 +226,6 @@ def analyze_audio(path, job_id):
             "confidence": round(seg["confidence"], 3),
         })
 
-    set_job(job_id, progress=96, stage="Finishing...")
     return {
         "job_id": job_id,
         "status": "completed",
@@ -234,7 +235,24 @@ def analyze_audio(path, job_id):
         "chord_count": len(final_segments),
         "segments": final_segments,
         "raw_chords": None,
+        "engine": "lightweight-harmonic-v2-fallback",
     }
+
+
+def analyze_audio(path, job_id):
+    def progress(value, stage):
+        set_job(job_id, progress=value, stage=stage)
+
+    try:
+        result = analyze_neural(path, progress_cb=progress)
+        result["job_id"] = job_id
+        result["status"] = "completed"
+        return result
+    except Exception as exc:
+        # Do not take the working product down if a model download or CPU runtime
+        # fails on the free host. The old analyzer remains an automatic fallback.
+        set_job(job_id, progress=10, stage=f"Neural engine unavailable; using fallback ({type(exc).__name__})")
+        return analyze_audio_lightweight(path, job_id)
 
 
 def worker(job_id, path):
@@ -252,7 +270,7 @@ def worker(job_id, path):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "earcolor-analyzer", "engine": "lightweight-harmonic-v2"}
+    return {"ok": True, "service": "earcolor-analyzer", "engine": "chordmini-neural-beat-v3", "fallback": "lightweight-harmonic-v2"}
 
 
 @app.get("/api/v1/health/ping")
@@ -262,7 +280,7 @@ def ping():
 
 @app.get("/api/v1/health")
 def api_health():
-    return {"status": "ok", "version": "2.0.0", "model_loaded": True, "engine": "lightweight-harmonic-v2"}
+    return {"status": "ok", "version": "3.0.0", "model_loaded": True, "engine": "chordmini-neural-beat-v3", "fallback": "lightweight-harmonic-v2"}
 
 
 @app.post("/api/v1/jobs")
